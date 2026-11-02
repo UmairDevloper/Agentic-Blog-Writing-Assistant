@@ -3,6 +3,8 @@ import base64
 from io import BytesIO
 
 import pytest
+import httpx
+from huggingface_hub.errors import HfHubHTTPError
 from PIL import Image
 from pydantic import SecretStr, ValidationError
 
@@ -21,10 +23,16 @@ def _png_image() -> Image.Image:
 
 class FakeInferenceClient:
     def __init__(self) -> None:
-        self.prompts: list[str] = []
+        self.calls: list[tuple[str, str, int | None]] = []
 
-    def text_to_image(self, prompt: str) -> Image.Image:
-        self.prompts.append(prompt)
+    def text_to_image(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        num_inference_steps: int | None = None,
+    ) -> Image.Image:
+        self.calls.append((prompt, model, num_inference_steps))
         return _png_image()
 
 
@@ -33,6 +41,8 @@ def test_huggingface_provider_returns_validated_png_without_network() -> None:
     provider = HuggingFaceImageProvider(
         "owner/open-image-model",
         SecretStr("hf-test-secret"),
+        inference_provider="fal-ai",
+        num_inference_steps=7,
         timeout_seconds=30,
         client=client,
     )
@@ -41,7 +51,9 @@ def test_huggingface_provider_returns_validated_png_without_network() -> None:
         provider.generate_image("Editorial illustration", "A blue square")
     )
 
-    assert client.prompts == ["Editorial illustration"]
+    assert client.calls == [
+        ("Editorial illustration", "owner/open-image-model", 7)
+    ]
     assert result.model_name == "owner/open-image-model"
     assert result.media_type == "image/png"
     image_data = base64.b64decode(result.image_base64, validate=True)
@@ -50,9 +62,54 @@ def test_huggingface_provider_returns_validated_png_without_network() -> None:
         assert image.size == (2, 2)
 
 
+def test_huggingface_provider_configures_provider_and_passes_model_and_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from seo_blog_assistant.providers import image as image_module
+
+    captured: dict[str, object] = {}
+    clients: list[FakeInferenceClient] = []
+
+    class FakeConfiguredInferenceClient(FakeInferenceClient):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__()
+            captured.update(kwargs)
+            clients.append(self)
+
+    monkeypatch.setattr(image_module, "InferenceClient", FakeConfiguredInferenceClient)
+
+    provider = create_image_provider(
+        Settings(
+            _env_file=None,
+            image_provider="huggingface",
+            image_model_name="owner/open-image-model",
+            image_inference_provider="fal-ai",
+            image_num_inference_steps=7,
+            huggingface_token=SecretStr("hf-test-secret"),
+            image_timeout_seconds=45,
+        )
+    )
+    asyncio.run(provider.generate_image("Editorial scene", "A test image"))
+
+    assert captured == {
+        "provider": "fal-ai",
+        "token": "hf-test-secret",
+        "timeout": 45,
+    }
+    assert clients[0].calls == [
+        ("Editorial scene", "owner/open-image-model", 7)
+    ]
+
+
 def test_huggingface_provider_sanitizes_hosted_inference_errors() -> None:
     class FailedInferenceClient:
-        def text_to_image(self, _prompt: str) -> Image.Image:
+        def text_to_image(
+            self,
+            _prompt: str,
+            *,
+            model: str,
+            num_inference_steps: int | None = None,
+        ) -> Image.Image:
             raise TimeoutError("request failed with hf-private-token")
 
     provider = HuggingFaceImageProvider(
@@ -61,10 +118,113 @@ def test_huggingface_provider_sanitizes_hosted_inference_errors() -> None:
         client=FailedInferenceClient(),
     )
 
-    with pytest.raises(ImageProviderError, match="generation failed") as error:
+    with pytest.raises(ImageProviderError, match="request timed out") as error:
         asyncio.run(provider.generate_image("An image", "An image"))
 
     assert "hf-private-token" not in str(error.value)
+
+
+def test_huggingface_provider_sanitizes_unexpected_model_errors() -> None:
+    class UnsupportedModelClient:
+        def text_to_image(
+            self,
+            _prompt: str,
+            *,
+            model: str,
+            num_inference_steps: int | None = None,
+        ) -> Image.Image:
+            raise ValueError("private account details")
+
+    provider = HuggingFaceImageProvider(
+        "owner/open-image-model",
+        SecretStr("hf-test-secret"),
+        client=UnsupportedModelClient(),
+    )
+
+    with pytest.raises(ImageProviderError, match="ValueError") as error:
+        asyncio.run(provider.generate_image("An image", "An image"))
+
+    assert "private account details" not in str(error.value)
+
+
+def test_huggingface_provider_does_not_forward_exception_message() -> None:
+    class FailedInferenceClient:
+        def text_to_image(
+            self,
+            _prompt: str,
+            *,
+            model: str,
+            num_inference_steps: int | None = None,
+        ) -> Image.Image:
+            raise ImageProviderError("hf-private-token and private provider body")
+
+    provider = HuggingFaceImageProvider(
+        "owner/open-image-model",
+        SecretStr("hf-private-token"),
+        client=FailedInferenceClient(),
+    )
+
+    with pytest.raises(ImageProviderError) as error:
+        asyncio.run(provider.generate_image("private prompt", "An image"))
+
+    assert "ImageProviderError" in str(error.value)
+    assert "hf-private-token" not in str(error.value)
+    assert "private provider body" not in str(error.value)
+    assert "private prompt" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "message"),
+    [
+        (401, "token rejected"),
+        (403, "token rejected"),
+        (402, "monthly credits exhausted"),
+        (404, "model not available"),
+        (422, "model not available"),
+        (429, "rate limited"),
+        (503, "provider error \\(503\\)"),
+    ],
+)
+def test_huggingface_provider_maps_hosted_http_statuses(
+    status_code: int,
+    message: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailedInferenceClient:
+        def text_to_image(
+            self,
+            _prompt: str,
+            *,
+            model: str,
+            num_inference_steps: int | None = None,
+        ) -> Image.Image:
+            response = httpx.Response(
+                status_code,
+                request=httpx.Request("POST", "https://api-inference.huggingface.co"),
+            )
+            raise HfHubHTTPError(
+                "private provider response hf-test-secret prompt text",
+                response=response,
+            )
+
+    provider = HuggingFaceImageProvider(
+        "owner/open-image-model",
+        SecretStr("hf-test-secret"),
+        inference_provider="fal-ai",
+        client=FailedInferenceClient(),
+    )
+
+    with pytest.raises(ImageProviderError, match=message) as error:
+        asyncio.run(provider.generate_image("private prompt", "An image"))
+
+    assert "private provider response" not in str(error.value)
+    assert "hf-test-secret" not in str(error.value)
+    assert "private prompt" not in str(error.value)
+    assert "owner/open-image-model" in str(error.value)
+    assert "fal-ai" in str(error.value)
+    assert f"type=HfHubHTTPError status={status_code}" in caplog.text
+    assert "hf-test-secret" not in caplog.text
+    assert "private prompt" not in caplog.text
 
 
 @pytest.mark.parametrize(

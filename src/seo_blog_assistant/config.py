@@ -23,6 +23,11 @@ class Settings(BaseSettings):
 
     app_env: Literal["development", "test", "production"] = "development"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    writing_mode: Literal["batched", "per_section"] = "batched"
+    max_words_per_call: int = Field(default=1500, ge=300, le=4000)
+    max_images: int = Field(default=3, ge=0, le=4)
+    image_mode: Literal["placeholder", "generate", "off"] = "placeholder"
+    text_model_reasoning_effort: Literal["low", "medium", "high"] | None = "low"
 
     text_model_provider: Literal["groq"] | None = None
     text_model_name: str | None = None
@@ -35,14 +40,22 @@ class Settings(BaseSettings):
         ),
     )
     text_model_timeout_seconds: int = Field(default=120, ge=1, le=600)
+    text_model_max_concurrency: int = Field(default=2, ge=1, le=10)
+    text_model_max_attempts: int = Field(default=4, ge=1, le=8)
+    text_model_max_completion_tokens: int = Field(default=4096, ge=256, le=32768)
+    text_model_requests_per_second: float | None = Field(default=None, gt=0)
 
     search_provider: Literal["tavily"] | None = None
     search_api_key: SecretStr | None = None
     search_timeout_seconds: int = Field(default=30, ge=1, le=120)
     search_max_results: int = Field(default=5, ge=1, le=20)
+    search_max_attempts: int = Field(default=3, ge=1, le=5)
+    search_queries_per_article: int = Field(default=2, ge=1, le=3)
 
     image_provider: Literal["huggingface"] | None = None
     image_model_name: str | None = None
+    image_inference_provider: str = "auto"
+    image_num_inference_steps: int | None = Field(default=4, ge=1, le=50)
     huggingface_token: SecretStr | None = None
     image_timeout_seconds: int = Field(default=120, ge=1, le=600)
 

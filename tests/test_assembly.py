@@ -101,6 +101,7 @@ def test_assembly_is_deterministic_and_orders_sections_by_plan() -> None:
         "## Conclusion\n\nReview the most important takeaways.\n"
     )
     assert result.sources == []
+    assert result.warnings == []
     assert result.image_result.status == "skipped"
     assert assemble_article(
         plan=plan,
@@ -139,7 +140,6 @@ def test_assembly_preserves_research_metadata_and_renders_valid_citations() -> N
     [
         ([_draft(0), _draft(1)], None, "exactly one draft"),
         ([_draft(0), _draft(1), _draft(1)], None, "section identities"),
-        ([_draft(0, ["missing_source"]), _draft(1), _draft(2)], _research(), "not present"),
     ],
 )
 def test_assembly_rejects_incomplete_or_untraceable_drafts(
@@ -159,7 +159,7 @@ def test_assembly_rejects_incomplete_or_untraceable_drafts(
         )
 
 
-def test_assembly_rejects_prose_citation_without_declared_source_id() -> None:
+def test_assembly_accepts_inline_known_citation_without_declared_source_id() -> None:
     drafts = [_draft(0), _draft(1), _draft(2)]
     drafts[0] = drafts[0].model_copy(
         update={
@@ -172,16 +172,50 @@ def test_assembly_rejects_prose_citation_without_declared_source_id() -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="undeclared citations"):
-        assemble_article(
-            plan=_plan(),
-            bookends=ArticleBookends(
-                introduction="Introduce the topic.",
-                conclusion="Review the takeaways.",
-            ),
-            section_drafts=drafts,
-            research=_research(),
-        )
+    result = assemble_article(
+        plan=_plan(),
+        bookends=ArticleBookends(
+            introduction="Introduce the topic.",
+            conclusion="Review the takeaways.",
+        ),
+        section_drafts=drafts,
+        research=_research(),
+    )
+
+    assert "[source_1]" in result.markdown
+    assert [source.source_id for source in result.sources] == ["source_1"]
+
+
+def test_assembly_removes_unknown_citations_and_carries_warnings() -> None:
+    drafts = [_draft(0, ["missing_source"]), _draft(1), _draft(2)]
+    drafts[0] = drafts[0].model_copy(
+        update={
+            "subsections": [
+                DraftSubsection(
+                    heading="How it works",
+                    content="Explain the process. [source_missing]",
+                    source_ids=["missing_source"],
+                )
+            ]
+        }
+    )
+
+    result = assemble_article(
+        plan=_plan(),
+        bookends=ArticleBookends(
+            introduction="Introduce the topic.",
+            conclusion="Review the takeaways.",
+        ),
+        section_drafts=drafts,
+        research=_research(),
+        warnings=["A section was repaired."],
+    )
+
+    assert "[source_missing]" not in result.markdown
+    assert result.sources == []
+    assert "A section was repaired." in result.warnings
+    assert any("removed citations" in warning for warning in result.warnings)
+    assert any("removed an inline citation" in warning for warning in result.warnings)
 
 
 def test_article_schema_rejects_unknown_markdown_citation() -> None:

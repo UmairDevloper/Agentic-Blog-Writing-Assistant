@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from pydantic import SecretStr, ValidationError
 
@@ -41,6 +43,34 @@ def test_settings_accept_hugging_face_image_provider() -> None:
     assert settings.huggingface_token == SecretStr("hf-placeholder")
 
 
+def test_settings_image_provider_defaults_and_environment_example() -> None:
+    settings = Settings(_env_file=None)
+    env_example = (
+        Path(__file__).resolve().parents[1] / ".env.example"
+    ).read_text(encoding="utf-8")
+
+    assert settings.image_inference_provider == "auto"
+    assert settings.image_num_inference_steps == 4
+    assert settings.search_queries_per_article == 2
+    assert settings.image_mode == "placeholder"
+    assert settings.max_images == 3
+    assert settings.huggingface_token is None
+    assert settings.image_model_name is None
+    assert "SEO_BLOG_IMAGE_MODE=placeholder" in env_example
+    assert "SEO_BLOG_MAX_IMAGES=3" in env_example
+    assert "SEO_BLOG_IMAGE_INFERENCE_PROVIDER=auto" in env_example
+    assert "SEO_BLOG_IMAGE_NUM_INFERENCE_STEPS=4" in env_example
+    assert "SEO_BLOG_SEARCH_QUERIES_PER_ARTICLE=2" in env_example
+    assert (
+        "SEO_BLOG_IMAGE_MODEL_NAME=black-forest-labs/FLUX.1-schnell"
+        in env_example
+    )
+    assert "SEO_BLOG_IMAGE_PROVIDER=huggingface" in env_example
+    assert "SEO_BLOG_HUGGINGFACE_TOKEN=replace-with-your-huggingface-token" in (
+        env_example
+    )
+
+
 def test_settings_accept_tavily_search_provider_and_bounds() -> None:
     settings = Settings(
         _env_file=None,
@@ -67,7 +97,58 @@ def test_settings_accept_groq_text_model_configuration() -> None:
     assert settings.text_model_provider == "groq"
     assert settings.text_model_name == "test-model"
     assert settings.text_model_timeout_seconds == 45
+    assert settings.text_model_max_concurrency == 2
+    assert settings.text_model_max_attempts == 4
+    assert settings.text_model_max_completion_tokens == 4096
+    assert settings.writing_mode == "batched"
+    assert settings.max_words_per_call == 1500
+    assert settings.max_images == 3
+    assert settings.text_model_reasoning_effort == "low"
     assert "test-api-key" not in repr(settings)
+
+
+def test_settings_accepts_low_token_mode_options() -> None:
+    settings = Settings(
+        _env_file=None,
+        writing_mode="per_section",
+        max_words_per_call=1800,
+        max_images=0,
+        text_model_reasoning_effort=None,
+    )
+
+    assert settings.writing_mode == "per_section"
+    assert settings.max_words_per_call == 1800
+    assert settings.max_images == 0
+    assert settings.text_model_reasoning_effort is None
+
+
+@pytest.mark.parametrize("image_mode", ["placeholder", "generate", "off"])
+def test_settings_accepts_image_modes(image_mode: str) -> None:
+    settings = Settings(_env_file=None, image_mode=image_mode)
+
+    assert settings.image_mode == image_mode
+
+
+def test_settings_rejects_unknown_image_mode() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, image_mode="automatic")
+
+
+def test_settings_accept_text_model_resilience_configuration() -> None:
+    settings = Settings(
+        _env_file=None,
+        text_model_max_concurrency=3,
+        text_model_max_attempts=5,
+        text_model_max_completion_tokens=2048,
+        text_model_requests_per_second=0.5,
+        search_max_attempts=4,
+    )
+
+    assert settings.text_model_max_concurrency == 3
+    assert settings.text_model_max_attempts == 5
+    assert settings.text_model_max_completion_tokens == 2048
+    assert settings.text_model_requests_per_second == 0.5
+    assert settings.search_max_attempts == 4
 
 
 @pytest.mark.parametrize(
@@ -96,7 +177,35 @@ def test_settings_reject_out_of_range_search_limits() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, search_max_results=21)
     with pytest.raises(ValidationError):
+        Settings(_env_file=None, search_queries_per_article=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, search_queries_per_article=4)
+    with pytest.raises(ValidationError):
         Settings(_env_file=None, text_model_timeout_seconds=601)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, text_model_max_concurrency=11)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, text_model_max_attempts=9)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, text_model_max_completion_tokens=255)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, text_model_requests_per_second=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, writing_mode="parallel")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, max_words_per_call=299)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, max_words_per_call=4001)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, max_images=5)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, image_num_inference_steps=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, image_num_inference_steps=51)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, text_model_reasoning_effort="extreme")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, search_max_attempts=6)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, text_model_provider="openai")
 

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import TypeVar
 
 import pytest
@@ -10,6 +11,7 @@ from seo_blog_assistant.schemas import (
     ResearchDecision,
     SEOPlan,
 )
+from seo_blog_assistant.providers.text_model import TextResult
 from seo_blog_assistant.workflow.planning import (
     SEO_PLAN_SYSTEM_PROMPT,
     create_seo_plan,
@@ -38,6 +40,15 @@ class FakeStructuredTextModel:
             }
         )
         return schema.model_validate(self.response)
+
+    async def generate_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+    ) -> TextResult:
+        raise AssertionError("Planning only uses structured output.")
 
 
 def _plan(target_words: int = 1200) -> SEOPlan:
@@ -108,8 +119,15 @@ def test_model_knowledge_plan_is_a_brief_not_finished_article_prose() -> None:
     assert plan.target_words == request.target_words
     assert [section.position for section in plan.sections] == [0, 1, 2]
     assert "not finished article prose" in SEO_PLAN_SYSTEM_PROMPT
+    assert "at most 4 key points" in SEO_PLAN_SYSTEM_PROMPT
+    assert "at most 8 related keyword ideas" in SEO_PLAN_SYSTEM_PROMPT
     assert len(model.calls) == 1
     assert '"research_mode": "model_knowledge"' in str(model.calls[0]["user_prompt"])
+    prompt_payload = json.loads(str(model.calls[0]["user_prompt"]))
+    assert prompt_payload["request"]["topic"] == request.topic
+    assert "audience" not in prompt_payload["request"]
+    assert "seo_goals" not in prompt_payload["request"]
+    assert "null" not in str(model.calls[0]["user_prompt"])
 
 
 def test_research_plan_requires_a_completed_search_bundle() -> None:
@@ -140,16 +158,28 @@ def test_research_plan_receives_evidence_from_completed_search() -> None:
     assert plan.title == "A practical topic guide"
     assert '"source_id": "source_1"' in str(model.calls[0]["user_prompt"])
     assert '"evidence_id": "evidence_1"' in str(model.calls[0]["user_prompt"])
+    assert "search_queries" not in str(model.calls[0]["user_prompt"])
+    assert "example.com" not in str(model.calls[0]["user_prompt"])
 
 
-def test_plan_must_preserve_requested_article_length() -> None:
-    model = FakeStructuredTextModel(_plan(target_words=1000))
+def test_plan_target_length_is_repaired_to_match_request() -> None:
+    plan_data = _plan(target_words=1000).model_dump()
+    plan_data["sections"][0]["word_budget"] = 267
+    plan_data["sections"][1]["word_budget"] = 267
+    plan_data["sections"][2]["word_budget"] = 266
+    model = FakeStructuredTextModel(SEOPlan.model_validate(plan_data))
 
-    with pytest.raises(ValueError, match="must match the requested"):
-        asyncio.run(
-            create_seo_plan(
-                BlogRequest(topic="A useful topic", target_words=1200),
-                _decision("model_knowledge"),
-                model,
-            )
+    plan = asyncio.run(
+        create_seo_plan(
+            BlogRequest(topic="A useful topic", target_words=1200),
+            _decision("model_knowledge"),
+            model,
         )
+    )
+
+    assert plan.target_words == 1200
+    assert (
+        plan.introduction_word_budget
+        + sum(section.word_budget for section in plan.sections)
+        + plan.conclusion_word_budget
+    ) == 1200
